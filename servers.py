@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """Extract one country's Proton VPN locations from the client's own cache.
 
@@ -19,17 +20,106 @@ Usage: servers.py <COUNTRY_CODE> [limit]   one country's cities, best-first
        servers.py --locate <SERVER_NAME>    one server's city and coordinates
 Prints compact JSON, or [] / {} when the cache is missing.
 """
+
 import json
 import os
 import sys
+import math
 
-# Proton's feature bitmask, from proton.vpn.session.servers.enums.
+CACHE = os.path.expanduser("~/.cache/Proton/VPN/serverlist.json")
+
+# Proton feature bitmask.
 SECURE_CORE = 1
 TOR = 2
 P2P = 4
 STREAMING = 8
 
-CACHE = os.path.expanduser("~/.cache/Proton/VPN/serverlist.json")
+
+def logical_servers(data):
+    """Return the logical server list, tolerating missing or invalid data."""
+    if not isinstance(data, dict):
+        return []
+    servers = data.get("LogicalServers")
+    return servers if isinstance(servers, list) else []
+
+
+def read_cache():
+    try:
+        with open(CACHE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def features_of(server):
+    """Return Features as an integer, even if the cache contains bad data."""
+    try:
+        return int(server.get("Features") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def status_value(value):
+    """Normalize supported status values to True, False, or None."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def status_known(data):
+    """Only enforce logical-server status when the cache has usable data."""
+    return any(
+        status_value(s.get("Status")) is True
+        for s in logical_servers(data)
+        if isinstance(s, dict)
+    )
+
+
+def usable(server, check_status=True):
+    """Exclude Secure Core and, when reliable, unavailable logical servers."""
+    if not isinstance(server, dict):
+        return False
+
+    if features_of(server) & SECURE_CORE:
+        return False
+
+    if check_status:
+        return status_value(server.get("Status")) is True
+
+    return True
+
+
+def location_of(server, entry=False):
+    """Read coordinates from the new cache, with support for the old format."""
+    if entry:
+        loc = server.get("EntryLocation") or {}
+    else:
+        loc = server.get("ExitLocation") or server.get("Location") or {}
+
+    if not isinstance(loc, dict):
+        return None, None
+
+    # New schema: Latitude / Longitude.
+    # Old schema: Lat / Long.
+    lat = loc.get("Latitude", loc.get("Lat"))
+    lon = loc.get("Longitude", loc.get("Long"))
+
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return None, None
+
+    if not math.isfinite(lat) or not math.isfinite(lon):
+        return None, None
+
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None, None
+
+    return lat, lon
 
 
 def labels(features):
@@ -43,196 +133,259 @@ def labels(features):
     return out
 
 
-def read_cache():
+def score_of(server):
     try:
-        with open(CACHE, "r") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return None
+        score = float(server.get("Score"))
+        return score if math.isfinite(score) else 9e9
+    except (TypeError, ValueError):
+        return 9e9
 
 
-def status_known(data):
-    """Whether Status carries any information in this cache.
-
-    Proton fills Status in from a *separate* "loads" refresh
-    (`Status = 1 if server_load.enabled else 0` in its own types.py). Until
-    that call has succeeded, or when it fails, every server in the file reads
-    Status 0. That means "we don't know yet", not "all 18,000 servers are
-    down", and taking it literally empties the map and every city list.
-
-    So Status is honoured only when at least one server is marked up.
-    """
-    for s in data.get("LogicalServers") or []:
-        if s.get("Status") == 1:
-            return True
-    return False
+def load_of(server):
+    try:
+        load = int(server.get("Load"))
+        return load if load >= 0 else 999
+    except (TypeError, ValueError):
+        return 999
 
 
-def usable(s, check_status=True):
-    """Connectable, and not Secure Core (those are reached via --securecore)."""
-    if check_status and s.get("Status") != 1:
-        return False
-    return not ((s.get("Features") or 0) & SECURE_CORE)
+def tier_of(server):
+    return server.get("Tier")
 
 
 def all_cities(data):
-    """Every city worldwide: one entry per (country, city) with its coordinates
-    and best server. Feeds the panel's mini-map; ~200 rows for ~18k servers."""
+    """One row per country and city, retaining the best logical server."""
     out = {}
     check_status = status_known(data)
-    for s in data.get("LogicalServers") or []:
-        if not usable(s, check_status):
+
+    for server in logical_servers(data):
+        if not usable(server, check_status):
             continue
-        loc = s.get("Location") or {}
-        lat, lon = loc.get("Lat"), loc.get("Long")
-        if lat is None or lon is None:
+
+        lat, lon = location_of(server)
+        if lat is None:
             continue
-        code = (s.get("ExitCountry") or "").upper()
-        city = (s.get("City") or "").strip()
-        if code == "" or city == "":
+
+        code = str(server.get("ExitCountry") or "").strip().upper()
+        city = str(server.get("City") or "").strip()
+
+        if not code or not city:
             continue
-        score = s.get("Score")
-        score = score if score is not None else 9e9
+
         key = (code, city)
+        score = score_of(server)
         entry = out.get(key)
-        if entry is None or score < entry["score"]:
+
+        if entry is None:
             out[key] = {
                 "code": code,
                 "city": city,
-                "lat": round(float(lat), 3),
-                "lon": round(float(lon), 3),
-                "name": s.get("Name") or "",
-                "load": s.get("Load"),
-                "tier": s.get("Tier"),
+                "lat": round(lat, 3),
+                "lon": round(lon, 3),
+                "name": server.get("Name") or "",
+                "load": server.get("Load"),
+                "tier": tier_of(server),
                 "score": score,
-                "count": (entry["count"] + 1) if entry else 1,
-            }
-        else:
-            entry["count"] += 1
-    rows = sorted(out.values(), key=lambda r: (r["code"], r["city"]))
-    for r in rows:
-        del r["score"]
-    return rows
-
-
-def country_place(data, code):
-    """Where a country is, for the map: the location of its first regular
-    server. Secure Core entry countries (CH, IS, SE) each have one city."""
-    for s in data.get("LogicalServers") or []:
-        if (s.get("ExitCountry") or "").upper() != code:
-            continue
-        if (s.get("Features") or 0) & SECURE_CORE:
-            continue
-        loc = s.get("Location") or {}
-        if loc.get("Lat") is None or loc.get("Long") is None:
-            continue
-        return {
-            "code": code,
-            "city": (s.get("City") or "").strip(),
-            "lat": loc.get("Lat"),
-            "lon": loc.get("Long"),
-        }
-    return None
-
-
-def locate(data, name):
-    """Where one server is. Used to light up the connected city on the map.
-    A Secure Core server (CH-US#3: enters Switzerland, exits New York) also
-    carries its entry hop so the map can draw the route."""
-    want = name.strip().upper()
-    for s in data.get("LogicalServers") or []:
-        if (s.get("Name") or "").upper() != want:
-            continue
-        loc = s.get("Location") or {}
-        features = s.get("Features") or 0
-        place = {
-            "name": s.get("Name") or "",
-            "code": (s.get("ExitCountry") or "").upper(),
-            "city": (s.get("City") or "").strip(),
-            "lat": loc.get("Lat"),
-            "lon": loc.get("Long"),
-            # Feature bit 4 is P2P. Most servers permit it, so the panel only
-            # makes a point of it when that's what you asked for.
-            "p2p": bool(features & P2P),
-        }
-        entry_code = (s.get("EntryCountry") or "").upper()
-        if (s.get("Features") or 0) & SECURE_CORE and entry_code and entry_code != place["code"]:
-            entry = country_place(data, entry_code)
-            if entry:
-                place["entry"] = entry
-        return place
-    return {}
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("[]")
-        return
-    data = read_cache()
-    if sys.argv[1] == "--cities":
-        print(json.dumps(all_cities(data) if data else [], separators=(",", ":")))
-        return
-    if sys.argv[1] == "--locate":
-        name = sys.argv[2] if len(sys.argv) > 2 else ""
-        print(json.dumps(locate(data, name) if (data and name) else {}, separators=(",", ":")))
-        return
-    if data is None:
-        print("[]")
-        return
-    code = sys.argv[1].strip().upper()
-    limit = int(sys.argv[2]) if len(sys.argv) > 2 else 80
-
-    # city -> best server seen so far, plus a count of that city's servers.
-    cities = {}
-    check_status = status_known(data)
-    for s in data.get("LogicalServers") or []:
-        # Status 0 means under maintenance, but only once we know Status has
-        # been populated at all: see status_known().
-        if check_status and s.get("Status") != 1:
-            continue
-        if (s.get("ExitCountry") or "").upper() != code:
-            continue
-        features = s.get("Features") or 0
-        # Secure Core entries are reached via --securecore, not by name here;
-        # listing them under their exit country would be misleading.
-        if features & SECURE_CORE:
-            continue
-
-        # Some servers carry no city; group them together rather than dropping
-        # them, so small countries don't come back empty.
-        city = (s.get("City") or "").strip() or "Other"
-        score = s.get("Score")
-        score = score if score is not None else 9e9
-        load = s.get("Load")
-        load = load if load is not None else 999
-
-        entry = cities.get(city)
-        if entry is None:
-            cities[city] = {
-                "city": city,
-                "name": s.get("Name") or "",
-                "load": s.get("Load"),
-                "tier": s.get("Tier"),
-                "score": score,
-                "tags": labels(features),
                 "count": 1,
             }
             continue
 
         entry["count"] += 1
-        # Score is Proton's own "fastest" metric (lower is better) and is what
-        # the CLI sorts on; load breaks ties.
-        if (score, load) < (entry["score"], entry["load"] if entry["load"] is not None else 999):
+
+        if score < entry["score"]:
             entry.update({
-                "name": s.get("Name") or "",
-                "load": s.get("Load"),
-                "tier": s.get("Tier"),
+                "lat": round(lat, 3),
+                "lon": round(lon, 3),
+                "name": server.get("Name") or "",
+                "load": server.get("Load"),
+                "tier": tier_of(server),
                 "score": score,
-                "tags": labels(features),
             })
 
-    rows = sorted(cities.values(), key=lambda r: r["score"])
-    print(json.dumps(rows[:limit], separators=(",", ":")))
+    rows = sorted(out.values(), key=lambda r: (r["code"], r["city"]))
+
+    for row in rows:
+        del row["score"]
+
+    return rows
+
+
+def country_place(data, code):
+    """Find a regular server's location in a country."""
+    check_status = status_known(data)
+
+    for server in logical_servers(data):
+        if not isinstance(server, dict):
+            continue
+
+        if str(server.get("ExitCountry") or "").upper() != code:
+            continue
+
+        if not usable(server, check_status):
+            continue
+
+        lat, lon = location_of(server)
+        if lat is None:
+            continue
+
+        return {
+            "code": code,
+            "city": str(server.get("City") or "").strip(),
+            "lat": lat,
+            "lon": lon,
+        }
+
+    return None
+
+
+def locate(data, name):
+    """Find a logical server and its exit coordinates."""
+    want = name.strip().upper()
+    if not want:
+        return {}
+
+    for server in logical_servers(data):
+        if not isinstance(server, dict):
+            continue
+
+        server_name = str(server.get("Name") or "")
+        if server_name.upper() != want:
+            continue
+
+        features = features_of(server)
+        lat, lon = location_of(server)
+
+        place = {
+            "name": server_name,
+            "code": str(server.get("ExitCountry") or "").upper(),
+            "city": str(server.get("City") or "").strip(),
+            "lat": lat,
+            "lon": lon,
+            "p2p": bool(features & P2P),
+        }
+
+        entry_code = str(server.get("EntryCountry") or "").upper()
+
+        if features & SECURE_CORE and entry_code:
+            entry_lat, entry_lon = location_of(server, entry=True)
+
+            # Prefer the coordinates explicitly provided by EntryLocation.
+            # Fall back to a regular server in the entry country.
+            entry = country_place(data, entry_code)
+
+            if entry_lat is not None:
+                entry = entry or {
+                    "code": entry_code,
+                    "city": "",
+                    "lat": entry_lat,
+                    "lon": entry_lon,
+                }
+                entry["lat"] = entry_lat
+                entry["lon"] = entry_lon
+
+            if entry and entry_code != place["code"]:
+                place["entry"] = entry
+
+        return place
+
+    return {}
+
+
+def country_cities(data, code, limit=80):
+    """One row per city, selecting its best server by score and load."""
+    cities = {}
+    check_status = status_known(data)
+
+    for server in logical_servers(data):
+        if not isinstance(server, dict):
+            continue
+
+        if not usable(server, check_status):
+            continue
+
+        if str(server.get("ExitCountry") or "").upper() != code:
+            continue
+
+        city = str(server.get("City") or "").strip() or "Other"
+        score = score_of(server)
+        load = load_of(server)
+
+        entry = cities.get(city)
+
+        if entry is None:
+            cities[city] = {
+                "city": city,
+                "name": server.get("Name") or "",
+                "load": server.get("Load"),
+                "tier": tier_of(server),
+                "score": score,
+                "tags": labels(features_of(server)),
+                "count": 1,
+                "_load_sort": load,
+            }
+            continue
+
+        entry["count"] += 1
+
+        if (score, load) < (entry["score"], entry["_load_sort"]):
+            entry.update({
+                "name": server.get("Name") or "",
+                "load": server.get("Load"),
+                "tier": tier_of(server),
+                "score": score,
+                "tags": labels(features_of(server)),
+                "_load_sort": load,
+            })
+
+    rows = sorted(cities.values(), key=lambda r: (r["score"], r["_load_sort"]))
+
+    for row in rows:
+        del row["_load_sort"]
+        del row["score"]
+
+    return rows[:limit]
+
+
+def print_json(value):
+    print(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        print_json([])
+        return
+
+    data = read_cache()
+
+    if data is None:
+        print_json({} if args[0] == "--locate" else [])
+        return
+
+    if args[0] == "--cities":
+        print_json(all_cities(data))
+        return
+
+    if args[0] == "--locate":
+        print_json(locate(data, args[1]) if len(args) > 1 else {})
+        return
+
+    code = args[0].strip().upper()
+
+    if not code:
+        print_json([])
+        return
+
+    try:
+        limit = int(args[1]) if len(args) > 1 else 80
+    except ValueError:
+        limit = 80
+
+    # Avoid accidental huge output; zero returns no rows.
+    limit = max(0, min(limit, 10000))
+
+    print_json(country_cities(data, code, limit))
 
 
 if __name__ == "__main__":
