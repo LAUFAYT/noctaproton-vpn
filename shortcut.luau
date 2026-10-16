@@ -1,6 +1,7 @@
 --!nonstrict
 -- Proton VPN Control Center Shortcut
 
+local PANEL_ID = "riversyx/noctaproton-vpn:panel"
 local STATE_KEY = "protonvpn.status"
 local COMMAND_KEY = "protonvpn.cmd"
 
@@ -26,6 +27,10 @@ function onClick()
   else
     noctalia.state.set(COMMAND_KEY, { op = "connect", target = "fastest" })
   end
+end
+
+function onRightClick()
+  noctalia.togglePanel(PANEL_ID)
 end
 
 render()
