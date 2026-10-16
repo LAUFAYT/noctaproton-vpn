@@ -34,6 +34,7 @@
     "disconnect": "Disconnect",
     "quick_connect": "Quick Connect",
     "fastest": "Fastest",
+    "secure_core": "Sec.Core",
     "signin": "Sign In",
     "signout": "Sign Out",
     "copy_port": "Copy Port"
@@ -46,6 +47,8 @@
     "netshield_off": "Off",
     "netshield_malware": "Malware only",
     "netshield_all": "Malware, Ads & Trackers",
+    "vpn_accelerator": "VPN Accelerator",
+    "vpn_accelerator_desc": "Increase your connection speed by up to 400% with performance enhancing technologies.",
     "port_forwarding": "Port Forwarding",
     "port_forwarding_desc": "Assign an inbound port for P2P and BitTorrent applications.",
     "split_tunneling": "Split Tunneling",

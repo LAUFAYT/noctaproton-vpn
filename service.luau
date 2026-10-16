@@ -37,8 +37,9 @@ local snapshot = {
     plan = "",
   },
   config = {
-    killSwitch = "off",     -- "off" | "standard"
-    netshield = "off",      -- "off" | "malware-only" | "malware-ads-trackers"
+    killSwitch = "standard",     -- "off" | "standard"
+    netshield = "malware-only",      -- "off" | "malware-only" | "malware-ads-trackers"
+    vpnAccelerator = "on",
     portForwarding = "off", -- "off" | "on"
   },
   forwardedPort = nil,
@@ -497,6 +498,15 @@ noctalia.state.watch(COMMAND_KEY, function(cmd)
       publishState()
     end, 10000)
 
+  elseif op == "set_vpn_accelerator" then
+    local val = (cmd.value == "on") and "on" or "off"
+    noctalia.runAsync(`protonvpn config set vpn-accelerator {val}`, function(res)
+      if res.exitCode == 0 then
+        snapshot.config.vpnAccelerator = val
+      end
+      publishState()
+    end, 10000)
+
   elseif op == "set_netshield" then
     local val = cmd.value
     if val ~= "off" and val ~= "malware-only" and val ~= "malware-ads-trackers" then
@@ -616,3 +626,11 @@ loadCandidateApps()
 checkNmcliLink()
 pollProtonStatus()
 publishState()
+
+function onEnable()
+  noctalia.state.set(COMMAND_KEY, {
+  op = "connect",
+  target = "fastest"
+})
+end
+

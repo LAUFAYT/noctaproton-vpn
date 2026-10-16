@@ -2,7 +2,19 @@
 
 A sleek, native Noctalia shell plugin to control Proton VPN without needing the official GUI. Seamlessly manage your Kill Switch, NetShield ad/tracker blocker, Port Forwarding, and Split Tunneling, or hop countries and servers on the fly with live throughput graphs and dynamic theme coloring.
 
-Built for **Noctalia Shell**, extensively tested on **MangoWM** on **Arch Linux (CachyOS)**.
+Built for **Noctalia Shell**, custom version by me, just fixes and missing stuff
+
+---
+## Custom changes
+- Server list fixed
+- Server list shows country name instead of ISO-3166-1 code
+- Right click on Control Center shorcut opens the control panel
+- Secure Core option added (replaced "Fastest")
+- VPN Accelerator option in "Protection" menu
+- Automatic connection on startup (fastest)
+
+
+All info below is from the original readme file
 
 ---
 

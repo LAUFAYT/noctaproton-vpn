@@ -20,6 +20,7 @@ Usage: servers.py <COUNTRY_CODE> [limit]   one country's cities, best-first
 Prints compact JSON, or [] / {} when the cache is missing.
 """
 import json
+import math
 import os
 import sys
 
@@ -30,6 +31,68 @@ P2P = 4
 STREAMING = 8
 
 CACHE = os.path.expanduser("~/.cache/Proton/VPN/serverlist.json")
+
+# ISO 3166-1 alpha-2 code -> English country name, so the panel can say
+# "United States" instead of "US". Built in rather than pulled from a package
+# (pycountry) because the plugin only promises a bare Python 3.10+. Proton also
+# writes the United Kingdom as "UK" in places, which is not an ISO code, so both
+# spellings are listed. A code missing from here simply shows as the code.
+COUNTRIES = {
+    "AD": "Andorra", "AE": "United Arab Emirates", "AF": "Afghanistan",
+    "AG": "Antigua and Barbuda", "AL": "Albania", "AM": "Armenia",
+    "AO": "Angola", "AR": "Argentina", "AT": "Austria", "AU": "Australia",
+    "AZ": "Azerbaijan", "BA": "Bosnia and Herzegovina", "BB": "Barbados",
+    "BD": "Bangladesh", "BE": "Belgium", "BF": "Burkina Faso",
+    "BG": "Bulgaria", "BH": "Bahrain", "BI": "Burundi", "BJ": "Benin",
+    "BM": "Bermuda", "BN": "Brunei", "BO": "Bolivia", "BR": "Brazil",
+    "BS": "Bahamas", "BT": "Bhutan", "BW": "Botswana", "BY": "Belarus",
+    "BZ": "Belize", "CA": "Canada", "CD": "DR Congo", "CF": "Central African Republic",
+    "CG": "Republic of the Congo", "CH": "Switzerland", "CI": "Ivory Coast",
+    "CL": "Chile", "CM": "Cameroon", "CN": "China", "CO": "Colombia",
+    "CR": "Costa Rica", "CU": "Cuba", "CV": "Cape Verde", "CY": "Cyprus",
+    "CZ": "Czechia", "DE": "Germany", "DJ": "Djibouti", "DK": "Denmark",
+    "DO": "Dominican Republic", "DZ": "Algeria", "EC": "Ecuador",
+    "EE": "Estonia", "EG": "Egypt", "ER": "Eritrea", "ES": "Spain",
+    "ET": "Ethiopia", "FI": "Finland", "FJ": "Fiji", "FR": "France",
+    "GA": "Gabon", "GB": "United Kingdom", "GE": "Georgia", "GH": "Ghana",
+    "GI": "Gibraltar", "GL": "Greenland", "GM": "Gambia", "GN": "Guinea",
+    "GR": "Greece", "GT": "Guatemala", "GY": "Guyana", "HK": "Hong Kong",
+    "HN": "Honduras", "HR": "Croatia", "HT": "Haiti", "HU": "Hungary",
+    "ID": "Indonesia", "IE": "Ireland", "IL": "Israel", "IM": "Isle of Man",
+    "IN": "India", "IQ": "Iraq", "IR": "Iran", "IS": "Iceland", "IT": "Italy",
+    "JE": "Jersey", "JM": "Jamaica", "JO": "Jordan", "JP": "Japan",
+    "KE": "Kenya", "KG": "Kyrgyzstan", "KH": "Cambodia", "KR": "South Korea",
+    "KW": "Kuwait", "KZ": "Kazakhstan", "LA": "Laos", "LB": "Lebanon",
+    "LI": "Liechtenstein", "LK": "Sri Lanka", "LR": "Liberia", "LT": "Lithuania",
+    "LU": "Luxembourg", "LV": "Latvia", "LY": "Libya", "MA": "Morocco",
+    "MC": "Monaco", "MD": "Moldova", "ME": "Montenegro", "MG": "Madagascar",
+    "MK": "North Macedonia", "ML": "Mali", "MM": "Myanmar", "MN": "Mongolia",
+    "MO": "Macao", "MR": "Mauritania", "MT": "Malta", "MU": "Mauritius",
+    "MV": "Maldives", "MW": "Malawi", "MX": "Mexico", "MY": "Malaysia",
+    "MZ": "Mozambique", "NA": "Namibia", "NE": "Niger", "NG": "Nigeria",
+    "NI": "Nicaragua", "NL": "Netherlands", "NO": "Norway", "NP": "Nepal",
+    "NZ": "New Zealand", "OM": "Oman", "PA": "Panama", "PE": "Peru",
+    "PG": "Papua New Guinea", "PH": "Philippines", "PK": "Pakistan",
+    "PL": "Poland", "PR": "Puerto Rico", "PS": "Palestine", "PT": "Portugal",
+    "PY": "Paraguay", "QA": "Qatar", "RO": "Romania", "RS": "Serbia",
+    "RU": "Russia", "RW": "Rwanda", "SA": "Saudi Arabia", "SC": "Seychelles",
+    "SD": "Sudan", "SE": "Sweden", "SG": "Singapore", "SI": "Slovenia",
+    "SK": "Slovakia", "SL": "Sierra Leone", "SM": "San Marino", "SN": "Senegal",
+    "SO": "Somalia", "SR": "Suriname", "SS": "South Sudan", "SV": "El Salvador",
+    "SY": "Syria", "SZ": "Eswatini", "TD": "Chad", "TG": "Togo", "TH": "Thailand",
+    "TJ": "Tajikistan", "TL": "Timor-Leste", "TM": "Turkmenistan", "TN": "Tunisia",
+    "TR": "Turkey", "TT": "Trinidad and Tobago", "TW": "Taiwan", "TZ": "Tanzania",
+    "UA": "Ukraine", "UG": "Uganda", "UK": "United Kingdom", "US": "United States",
+    "UY": "Uruguay", "UZ": "Uzbekistan", "VA": "Vatican City", "VE": "Venezuela",
+    "VN": "Vietnam", "XK": "Kosovo", "YE": "Yemen", "ZA": "South Africa",
+    "ZM": "Zambia", "ZW": "Zimbabwe",
+}
+
+
+def country_name(code):
+    """The readable name for a country code, or the code itself if unknown."""
+    code = (code or "").strip().upper()
+    return COUNTRIES.get(code, code)
 
 
 def labels(features):
@@ -49,6 +112,48 @@ def read_cache():
             return json.load(fh)
     except (OSError, ValueError):
         return None
+
+
+def coords(s, entry=False):
+    """A server's (latitude, longitude), or (None, None) when it has none.
+
+    Where the coordinates live depends on the cache's schema, so every known
+    shape is tried in turn:
+
+      * current:  "ExitLocation" / "EntryLocation", each {"Latitude": ...,
+                  "Longitude": ...}. A server has no plain "Location" at all
+                  here, which is why looking only for that returned null for
+                  every city and server. Exit and entry differ only for
+                  Secure Core (CH-AR#2 exits in Buenos Aires, enters in
+                  Switzerland); for a regular server they are the same point.
+      * older:    a single "Location" holding {"Lat": ..., "Long": ...}
+                  (what proton.vpn.session.servers.types reads), or the same
+                  object spelled Latitude/Longitude.
+
+    entry=True asks for the entry hop instead of the exit. Unusable values
+    (missing, non-numeric, NaN, outside the globe) read as "no coordinates"
+    rather than putting a pin in the ocean at 0,0.
+    """
+    if entry:
+        candidates = [s.get("EntryLocation")]
+    else:
+        candidates = [s.get("ExitLocation"), s.get("Location")]
+    for loc in candidates:
+        if not isinstance(loc, dict):
+            continue
+        lat = loc.get("Latitude")
+        if lat is None:
+            lat = loc.get("Lat")
+        lon = loc.get("Longitude")
+        if lon is None:
+            lon = loc.get("Long")
+        try:
+            lat, lon = float(lat), float(lon)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+    return None, None
 
 
 def status_known(data):
@@ -83,8 +188,7 @@ def all_cities(data):
     for s in data.get("LogicalServers") or []:
         if not usable(s, check_status):
             continue
-        loc = s.get("Location") or {}
-        lat, lon = loc.get("Lat"), loc.get("Long")
+        lat, lon = coords(s)
         if lat is None or lon is None:
             continue
         code = (s.get("ExitCountry") or "").upper()
@@ -98,6 +202,7 @@ def all_cities(data):
         if entry is None or score < entry["score"]:
             out[key] = {
                 "code": code,
+                "country": country_name(code),
                 "city": city,
                 "lat": round(float(lat), 3),
                 "lon": round(float(lon), 3),
@@ -123,14 +228,15 @@ def country_place(data, code):
             continue
         if (s.get("Features") or 0) & SECURE_CORE:
             continue
-        loc = s.get("Location") or {}
-        if loc.get("Lat") is None or loc.get("Long") is None:
+        lat, lon = coords(s)
+        if lat is None or lon is None:
             continue
         return {
             "code": code,
+            "country": country_name(code),
             "city": (s.get("City") or "").strip(),
-            "lat": loc.get("Lat"),
-            "lon": loc.get("Long"),
+            "lat": lat,
+            "lon": lon,
         }
     return None
 
@@ -143,21 +249,30 @@ def locate(data, name):
     for s in data.get("LogicalServers") or []:
         if (s.get("Name") or "").upper() != want:
             continue
-        loc = s.get("Location") or {}
+        lat, lon = coords(s)
         features = s.get("Features") or 0
         place = {
             "name": s.get("Name") or "",
             "code": (s.get("ExitCountry") or "").upper(),
+            "country": country_name(s.get("ExitCountry")),
             "city": (s.get("City") or "").strip(),
-            "lat": loc.get("Lat"),
-            "lon": loc.get("Long"),
+            "lat": lat,
+            "lon": lon,
             # Feature bit 4 is P2P. Most servers permit it, so the panel only
             # makes a point of it when that's what you asked for.
             "p2p": bool(features & P2P),
         }
         entry_code = (s.get("EntryCountry") or "").upper()
         if (s.get("Features") or 0) & SECURE_CORE and entry_code and entry_code != place["code"]:
+            # The server's own EntryLocation is the exact entry hop; a regular
+            # server in the entry country is only the fallback for caches that
+            # don't carry it.
             entry = country_place(data, entry_code)
+            entry_lat, entry_lon = coords(s, entry=True)
+            if entry_lat is not None:
+                entry = entry or {"code": entry_code, "country": country_name(entry_code), "city": ""}
+                entry["lat"] = entry_lat
+                entry["lon"] = entry_lon
             if entry:
                 place["entry"] = entry
         return place

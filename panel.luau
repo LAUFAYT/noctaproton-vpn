@@ -18,7 +18,7 @@ local snapshot = noctalia.state.get(STATE_KEY) or {
   device = "proton0",
   signedIn = false,
   account = { username = "", plan = "" },
-  config = { killSwitch = "off", netshield = "off", portForwarding = "off" },
+  config = { killSwitch = "standard", netshield = "malware-only", vpnAccelerator = "on", portForwarding = "off" },
   forwardedPort = nil,
   traffic = { rxRate = 0, txRate = 0, sessionRx = 0, sessionTx = 0, uptimeSec = 0 },
   splitTunneling = { available = false, enabled = false, apps = {}, candidates = {} },
@@ -73,13 +73,13 @@ local function renderConnectionsTab()
   -- Quick connect feature row
   table.insert(rows, ui.row({ gap = 6, align = "center" }, {
     ui.button({
-      text = noctalia.tr("actions.fastest"),
-      glyph = "bolt",
+      text = noctalia.tr("actions.secure_core"),
+      glyph = "lock-share",
       variant = "outline",
       controlSize = "sm",
       flexGrow = 1,
       onClick = function()
-        sendCmd("connect", { target = "fastest" })
+        sendCmd("connect", { target = "sc" })
       end,
     }),
     ui.button({
@@ -289,6 +289,32 @@ local function renderProtectionTab()
         flexGrow = 1,
         onClick = function()
           sendCmd("set_netshield", { value = "malware-ads-trackers" })
+        end,
+      }),
+    }),
+  }))
+
+  -- 3.5. VPN Accelerator
+  local vaOn = (snapshot.config.vpnAccelerator == "on")
+  table.insert(rows, ui.column({
+    padding = 10,
+    radius = 10,
+    fill = "surface_variant/0.45",
+    gap = 6,
+    align = "stretch",
+  }, {
+    ui.row({ align = "center" }, {
+      ui.glyph({ name = "brand-speedtest", size = 18, color = vaOn and "primary" or "on_surface_variant" }),
+      ui.column({ flexGrow = 1, gap = 2 }, {
+        ui.label({ text = noctalia.tr("protection.vpn_accelerator"), fontWeight = "bold", fontSize = 13 }),
+        ui.label({ text = noctalia.tr("protection.vpn_accelerator_desc"), fontSize = 11, color = "on_surface_variant" }),
+      }),
+      ui.toggle({
+        checked = vaOn,
+        enabled = not snapshot.busy,
+        onChange = function(checked)
+          local val = (checked == "true" or checked == true) and "on" or "off"
+          sendCmd("set_vpn_accelerator", { value = val })
         end,
       }),
     }),
