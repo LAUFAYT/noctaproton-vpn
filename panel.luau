@@ -23,12 +23,22 @@ local snapshot = noctalia.state.get(STATE_KEY) or {
   traffic = { rxRate = 0, txRate = 0, sessionRx = 0, sessionTx = 0, uptimeSec = 0 },
   splitTunneling = { available = false, enabled = false, apps = {}, candidates = {} },
   countries = {},
+  cities = {},
+  citiesFor = "",
+  citiesLoading = false,
+  servers = {},
+  serversFor = "",
+  serversForCity = "",
+  serversLoading = false,
+  stats = { countries = 0, cities = 0, servers = 0 },
   statusText = "Disconnected",
 }
 
 local activeTab = "connections" -- "connections" | "protection" | "account"
 local filterText = ""
-local expanded = {}
+local selectedCountryCode = ""
+local selectedCountryName = ""
+local selectedCity = ""
 local selectedAppToAdd = ""
 local signinUserDraft = ""
 
@@ -67,6 +77,48 @@ local function sendCmd(op, payload)
 end
 
 -- ── Tab: Connections ──────────────────────────────────────────────────────
+-- Hierarchy, all fetched live: countries → cities → servers. Nothing here is
+-- hardcoded; every level comes from servers.py reading Proton's own cache.
+
+local function openCountry(code, name, cityQuery)
+  selectedCountryCode = code
+  selectedCountryName = name
+  selectedCity = ""
+  filterText = cityQuery or ""
+  sendCmd("get_cities", { country = code })
+  render()
+end
+
+local function openCity(city)
+  selectedCity = city
+  filterText = ""
+  sendCmd("get_servers", { country = selectedCountryCode, city = city })
+  render()
+end
+
+local function backToCountries()
+  selectedCountryCode = ""
+  selectedCountryName = ""
+  selectedCity = ""
+  filterText = ""
+  sendCmd("clear_selection")
+  render()
+end
+
+local function backToCities()
+  selectedCity = ""
+  filterText = ""
+  render()
+end
+
+local function joinTags(tags)
+  if type(tags) ~= "table" or #tags == 0 then return "" end
+  local parts = {}
+  for _, t in ipairs(tags) do
+    table.insert(parts, tostring(t))
+  end
+  return table.concat(parts, " · ")
+end
 
 local function renderConnectionsTab()
   local rows = {}
@@ -115,12 +167,35 @@ local function renderConnectionsTab()
     }),
   }))
 
-  -- Search filter input
+  -- Live totals line (auto-fetched via servers.py --stats)
+  local st = snapshot.stats or {}
+  if (tonumber(st.servers) or 0) > 0 then
+    table.insert(rows, ui.label({
+      text = `{st.countries or 0} countries  ·  {st.cities or 0} cities  ·  {st.servers or 0} servers — live`,
+      fontSize = 11,
+      color = "on_surface_variant",
+    }))
+  end
+
+  local inCountry = selectedCountryCode ~= ""
+  local inCity = inCountry and selectedCity ~= ""
+  local query = noctalia.string.trim(filterText):lower()
+
+  -- Search filter input (key per level so the field resets on drill-down)
+  local searchKey = "search-countries"
+  local searchPlaceholder = "Search country, code or city..."
+  if inCity then
+    searchKey = `search-servers-{selectedCountryCode}-{selectedCity}`
+    searchPlaceholder = `Search server in {selectedCity}...`
+  elseif inCountry then
+    searchKey = `search-cities-{selectedCountryCode}`
+    searchPlaceholder = `Search city in {selectedCountryName}...`
+  end
   table.insert(rows, ui.row({ gap = 8, align = "center" }, {
     ui.input({
-      key = "country-search",
+      key = searchKey,
       value = filterText,
-      placeholder = "Search country, code or city...",
+      placeholder = searchPlaceholder,
       flexGrow = 1,
       controlSize = "sm",
       onChange = "onSearchChange",
@@ -137,45 +212,243 @@ local function renderConnectionsTab()
     }),
   }))
 
-  -- Country list
+  -- ── Level 3: servers in a city ──────────────────────────────────────────
+  if inCity then
+    table.insert(rows, ui.row({ gap = 6, align = "center" }, {
+      ui.button({
+        glyph = "arrow-left",
+        variant = "ghost",
+        controlSize = "sm",
+        onClick = function()
+          backToCities()
+        end,
+      }),
+      ui.label({
+        text = `{selectedCountryName}  ›  {selectedCity}`,
+        fontSize = 13,
+        fontWeight = "bold",
+        flexGrow = 1,
+      }),
+    }))
+
+    if snapshot.serversLoading or snapshot.serversFor ~= selectedCountryCode or snapshot.serversForCity ~= selectedCity then
+      table.insert(rows, ui.column({ align = "center", padding = 20, gap = 6 }, {
+        ui.label({ text = `Loading servers in {selectedCity}...`, color = "on_surface_variant", fontSize = 12 }),
+      }))
+      return ui.column({ gap = 10, flexGrow = 1, align = "stretch" }, rows)
+    end
+
+    local serverList = {}
+    if snapshot.serversFor == selectedCountryCode and snapshot.serversForCity == selectedCity then
+      serverList = snapshot.servers or {}
+    end
+    local listItems = {}
+    for _, s in ipairs(serverList) do
+      local sname = tostring(s.name or "")
+      if sname ~= "" then
+      local match = (query == "") or sname:lower():find(query, 1, true)
+      if match then
+        local currentServer = tostring(snapshot.server or ""):upper()
+        local isCurrent = snapshot.connected and (currentServer == sname:upper())
+        local load = tonumber(s.load) or 50
+        local tierLabel = (tonumber(s.tier) == 0) and "Free" or "Plus"
+        local tags = joinTags(s.tags)
+        local sub = `{load}% load  ·  {tierLabel}`
+        if tags ~= "" then sub = `{sub}  ·  {tags}` end
+        local rowCode = sname
+        table.insert(listItems, ui.row({
+          key = `server-{rowCode}`,
+          align = "center",
+          paddingV = 6,
+          paddingH = 8,
+          radius = 8,
+          fill = isCurrent and "primary/0.15" or "surface_variant/0.3",
+        }, {
+          ui.column({ flexGrow = 1, gap = 2 }, {
+            ui.label({
+              text = sname,
+              fontSize = 13,
+              fontWeight = isCurrent and "bold" or "normal",
+              color = isCurrent and "primary" or "on_surface",
+            }),
+            ui.label({ text = sub, fontSize = 11, color = "on_surface_variant" }),
+          }),
+          ui.button({
+            text = isCurrent and noctalia.tr("status.connected") or noctalia.tr("actions.connect"),
+            variant = isCurrent and "primary" or "outline",
+            glyph = isCurrent and "check" or "player-play",
+            controlSize = "sm",
+            enabled = not isCurrent and not snapshot.busy,
+            onClick = function()
+              sendCmd("connect", { target = rowCode, kind = "server" })
+            end,
+          }),
+        }))
+      end
+      end
+    end
+
+    if #listItems == 0 then
+      table.insert(rows, ui.column({ align = "center", padding = 20, gap = 6 }, {
+        ui.glyph({ name = "search", size = 28, color = "on_surface_variant" }),
+        ui.label({ text = "No matching servers found", color = "on_surface_variant", fontSize = 12 }),
+      }))
+    else
+      table.insert(rows, ui.scroll({
+        key = `servers-scroll-{selectedCountryCode}-{selectedCity}`,
+        flexGrow = 1,
+        gap = 6,
+        align = "stretch",
+      }, listItems))
+    end
+    return ui.column({ gap = 10, flexGrow = 1, align = "stretch" }, rows)
+  end
+
+  -- ── Level 2: cities in a country ────────────────────────────────────────
+  if inCountry then
+    table.insert(rows, ui.row({ gap = 6, align = "center" }, {
+      ui.button({
+        glyph = "arrow-left",
+        variant = "ghost",
+        controlSize = "sm",
+        onClick = function()
+          backToCountries()
+        end,
+      }),
+      ui.label({
+        text = selectedCountryName ~= "" and selectedCountryName or selectedCountryCode,
+        fontSize = 13,
+        fontWeight = "bold",
+        flexGrow = 1,
+      }),
+    }))
+
+    if snapshot.citiesLoading or snapshot.citiesFor ~= selectedCountryCode then
+      table.insert(rows, ui.column({ align = "center", padding = 20, gap = 6 }, {
+        ui.label({ text = `Loading cities in {selectedCountryName}...`, color = "on_surface_variant", fontSize = 12 }),
+      }))
+      return ui.column({ gap = 10, flexGrow = 1, align = "stretch" }, rows)
+    end
+
+    local cityList = {}
+    if snapshot.citiesFor == selectedCountryCode then
+      cityList = snapshot.cities or {}
+    end
+    local listItems = {}
+    for _, c in ipairs(cityList) do
+      local city = tostring(c.city or "")
+      if city ~= "" then
+      local best = tostring(c.name or "")
+      local match = (query == "") or city:lower():find(query, 1, true) or best:lower():find(query, 1, true)
+      if match then
+        local currentCity = tostring(snapshot.city or ""):lower()
+        local isCurrentCity = snapshot.connected and (currentCity == city:lower())
+        local load = tonumber(c.load) or 50
+        local tags = joinTags(c.tags)
+        local sub = `Fastest: {best}  ·  {load}%`
+        if tags ~= "" then sub = `{sub}  ·  {tags}` end
+        sub = `{sub}  ·  {c.count or 0} servers`
+        local rowCity = city
+        table.insert(listItems, ui.row({
+          key = `city-{selectedCountryCode}-{rowCity}`,
+          align = "center",
+          paddingV = 6,
+          paddingH = 8,
+          radius = 8,
+          fill = isCurrentCity and "primary/0.15" or "surface_variant/0.3",
+        }, {
+          ui.column({ flexGrow = 1, gap = 2 }, {
+            ui.label({
+              text = rowCity,
+              fontSize = 13,
+              fontWeight = isCurrentCity and "bold" or "normal",
+              color = isCurrentCity and "primary" or "on_surface",
+            }),
+            ui.label({ text = sub, fontSize = 11, color = "on_surface_variant", maxLines = 1 }),
+          }),
+          ui.button({
+            text = noctalia.tr("actions.connect"),
+            variant = "outline",
+            glyph = "player-play",
+            controlSize = "sm",
+            enabled = not snapshot.busy,
+            onClick = function()
+              sendCmd("connect", { target = rowCity, kind = "city" })
+            end,
+          }),
+          ui.button({
+            glyph = "chevron-right",
+            variant = "ghost",
+            controlSize = "sm",
+            onClick = function()
+              openCity(rowCity)
+            end,
+          }),
+        }))
+      end
+      end
+    end
+
+    if #listItems == 0 then
+      table.insert(rows, ui.column({ align = "center", padding = 20, gap = 6 }, {
+        ui.glyph({ name = "search", size = 28, color = "on_surface_variant" }),
+        ui.label({ text = "No matching cities found", color = "on_surface_variant", fontSize = 12 }),
+      }))
+    else
+      table.insert(rows, ui.scroll({
+        key = `cities-scroll-{selectedCountryCode}`,
+        flexGrow = 1,
+        gap = 6,
+        align = "stretch",
+      }, listItems))
+    end
+    return ui.column({ gap = 10, flexGrow = 1, align = "stretch" }, rows)
+  end
+
+  -- ── Level 1: all countries ──────────────────────────────────────────────
   local countryList = snapshot.countries or {}
-  local listItems = {}
-  local query = noctalia.string.trim(filterText):lower()
+  if #countryList == 0 then
+    table.insert(rows, ui.column({ align = "center", padding = 20, gap = 8 }, {
+      ui.glyph({ name = "world", size = 28, color = "on_surface_variant" }),
+      ui.label({ text = "Fetching live server list...", color = "on_surface_variant", fontSize = 12 }),
+      ui.button({
+        text = "Retry",
+        glyph = "refresh",
+        variant = "outline",
+        controlSize = "sm",
+        onClick = function()
+          sendCmd("refresh")
+        end,
+      }),
+    }))
+    return ui.column({ gap = 10, flexGrow = 1, align = "stretch" }, rows)
+  end
 
   local matches = {}
   for i, c in ipairs(countryList) do
     local code = tostring(c.code or "")
     local name = tostring(c.name or code)
-    local cities = {}
-    for _, city in ipairs(c.cities or {}) do
-      if type(city) == "table" and city.server then
-        table.insert(cities, city)
-      end
-    end
     local rank = nil
-    local cityHits = {}
-    if query == "" or code:lower() == query then
-      rank = 0
-    elseif name:lower():sub(1, #query) == query then
-      rank = 1
-    elseif name:lower():find(query, 1, true) then
-      rank = 2
-    elseif #query >= 3 then
-      for _, city in ipairs(cities) do
-        if tostring(city.city or ""):lower():find(query, 1, true) then
-          table.insert(cityHits, city)
+    local cityMatch = false
+    if code ~= "" then
+      if query == "" or code:lower() == query then
+        rank = 0
+      elseif name:lower():sub(1, #query) == query then
+        rank = 1
+      elseif name:lower():find(query, 1, true) then
+        rank = 2
+      elseif #query >= 3 then
+        for _, city in ipairs(c.city_names or {}) do
+          if tostring(city):lower():find(query, 1, true) then
+            rank = 3
+            cityMatch = true
+            break
+          end
         end
       end
-      if #cityHits > 0 then
-        rank = 3
+      if rank then
+        table.insert(matches, { c = c, code = code, name = name, rank = rank, index = i, cityMatch = cityMatch })
       end
-    end
-    if rank then
-      table.insert(matches, {
-        c = c, code = code, name = name, rank = rank, index = i,
-        cities = if #cityHits > 0 then cityHits else cities,
-        cityMatch = #cityHits > 0,
-      })
     end
   end
   table.sort(matches, function(a, b)
@@ -183,13 +456,16 @@ local function renderConnectionsTab()
     return a.index < b.index
   end)
 
+  local listItems = {}
   for _, m in ipairs(matches) do
-    local c, code, name, cities, cityMatch = m.c, m.code, m.name, m.cities, m.cityMatch
-    local isCurrentCountry = snapshot.connected and (snapshot.country:upper() == code:upper())
-    local isExpanded = expanded[code] or cityMatch
+    local c, code, name = m.c, m.code, m.name
+    local upperCountry = tostring(snapshot.country or ""):upper()
+    local isCurrentCountry = snapshot.connected and (upperCountry == code:upper() or upperCountry == name:upper())
+    local rowCode = code
+    local rowName = name
 
     table.insert(listItems, ui.row({
-      key = `country-{code}`,
+      key = `country-{rowCode}`,
       align = "center",
       gap = 12,
       paddingV = 6,
@@ -206,7 +482,7 @@ local function renderConnectionsTab()
         justify = "center",
       }, {
         ui.label({
-          text = code,
+          text = rowCode,
           fontSize = 11,
           fontWeight = "bold",
           color = isCurrentCountry and "on_primary" or "on_surface_variant",
@@ -214,28 +490,16 @@ local function renderConnectionsTab()
       }),
       ui.column({ flexGrow = 1, gap = 2 }, {
         ui.label({
-          text = name,
+          text = rowName,
           fontSize = 13,
           fontWeight = isCurrentCountry and "bold" or "normal",
           color = isCurrentCountry and "primary" or "on_surface",
         }),
         ui.label({
-          text = if c.servers and c.servers > 0
-            then `{c.count or 0} {if c.count == 1 then "city" else "cities"}  ·  {c.servers} {if c.servers == 1 then "server" else "servers"}`
-            else `{c.count or 0} servers  ·  {c.load or 50}% load`,
+          text = `{c.count or 0} servers  ·  {c.cities or 0} cities  ·  {c.load or 50}% load`,
           fontSize = 11,
           color = "on_surface_variant",
         }),
-      }),
-      ui.button({
-        glyph = isExpanded and "chevron-up" or "chevron-down",
-        variant = "ghost",
-        controlSize = "sm",
-        visible = #cities > 0,
-        onClick = function()
-          expanded[code] = not expanded[code]
-          render()
-        end,
       }),
       ui.button({
         text = isCurrentCountry and noctalia.tr("status.connected") or noctalia.tr("actions.connect"),
@@ -244,52 +508,19 @@ local function renderConnectionsTab()
         controlSize = "sm",
         enabled = not isCurrentCountry and not snapshot.busy,
         onClick = function()
-          sendCmd("connect", { target = code })
+          sendCmd("connect", { target = rowCode, kind = "country" })
+        end,
+      }),
+      ui.button({
+        glyph = "chevron-right",
+        variant = "ghost",
+        controlSize = "sm",
+        onClick = function()
+          openCountry(rowCode, rowName, if m.cityMatch then query else "")
         end,
       }),
     }))
-
-    if isExpanded then
-      for _, city in ipairs(cities) do
-        local server = tostring(city.server)
-        local isCurrentServer = snapshot.connected and snapshot.server == server
-        table.insert(listItems, ui.row({
-          key = `city-{code}-{city.city}`,
-          align = "center",
-          gap = 12,
-          paddingV = 4,
-          paddingH = 8,
-          radius = 8,
-          fill = isCurrentServer and "primary/0.15" or "surface_variant/0.15",
-        }, {
-          ui.row({ width = 34 }, {}),
-          ui.column({ flexGrow = 1, gap = 1 }, {
-            ui.label({
-              text = tostring(city.city or server),
-              fontSize = 12,
-              fontWeight = isCurrentServer and "bold" or "normal",
-              color = isCurrentServer and "primary" or "on_surface",
-            }),
-            ui.label({
-              text = `{server}  ·  {city.load or "?"}% load  ·  {city.count or 0} {if city.count == 1 then "server" else "servers"}`,
-              fontSize = 10,
-              color = "on_surface_variant",
-            }),
-          }),
-          ui.button({
-            glyph = isCurrentServer and "check" or "player-play",
-            variant = isCurrentServer and "primary" or "ghost",
-            controlSize = "sm",
-            enabled = not isCurrentServer and not snapshot.busy,
-            onClick = function()
-              sendCmd("connect", { target = server })
-            end,
-          }),
-        }))
-      end
-    end
   end
-
   if #listItems == 0 then
     table.insert(rows, ui.column({ align = "center", padding = 20, gap = 6 }, {
       ui.glyph({ name = "search", size = 28, color = "on_surface_variant" }),
