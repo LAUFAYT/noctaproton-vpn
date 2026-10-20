@@ -138,6 +138,7 @@ def all_countries(data):
             "name": country_name(code),
             "count": e["count"],
             "cities": len(e["cities_set"]),
+            "city_names": sorted(e["cities_set"]),
             "load": round(e["load_sum"] / e["load_n"]) if e["load_n"] else 50,
             "tier": e["tier"] if e["tier"] is not None else 2,
         })
