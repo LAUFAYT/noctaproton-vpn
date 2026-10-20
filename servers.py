@@ -25,6 +25,7 @@ Usage:
 Prints compact JSON, or [] / {} when the cache is missing.
 """
 import json
+import math
 import os
 import sys
 
@@ -66,6 +67,48 @@ def read_cache():
             return json.load(fh)
     except (OSError, ValueError):
         return None
+
+
+def coords(s, entry=False):
+    """A server's (latitude, longitude), or (None, None) when it has none.
+
+    Where the coordinates live depends on the cache's schema, so every known
+    shape is tried in turn:
+
+      * current:  "ExitLocation" / "EntryLocation", each {"Latitude": ...,
+                  "Longitude": ...}. A server has no plain "Location" at all
+                  here, which is why looking only for that returned null for
+                  every city and server. Exit and entry differ only for
+                  Secure Core (CH-AR#2 exits in Buenos Aires, enters in
+                  Switzerland); for a regular server they are the same point.
+      * older:    a single "Location" holding {"Lat": ..., "Long": ...}
+                  (what proton.vpn.session.servers.types reads), or the same
+                  object spelled Latitude/Longitude.
+
+    entry=True asks for the entry hop instead of the exit. Unusable values
+    (missing, non-numeric, NaN, outside the globe) read as "no coordinates"
+    rather than putting a pin in the ocean at 0,0.
+    """
+    if entry:
+        candidates = [s.get("EntryLocation")]
+    else:
+        candidates = [s.get("ExitLocation"), s.get("Location")]
+    for loc in candidates:
+        if not isinstance(loc, dict):
+            continue
+        lat = loc.get("Latitude")
+        if lat is None:
+            lat = loc.get("Lat")
+        lon = loc.get("Longitude")
+        if lon is None:
+            lon = loc.get("Long")
+        try:
+            lat, lon = float(lat), float(lon)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+    return None, None
 
 
 def status_known(data):
@@ -154,8 +197,7 @@ def all_cities(data):
     for s in data.get("LogicalServers") or []:
         if not usable(s, check_status):
             continue
-        loc = s.get("Location") or {}
-        lat, lon = loc.get("Lat"), loc.get("Long")
+        lat, lon = coords(s)
         if lat is None or lon is None:
             continue
         code = (s.get("ExitCountry") or "").upper()
@@ -202,7 +244,7 @@ def cities_in_country(data, code, limit=500):
         if features & SECURE_CORE:
             continue
         city = (s.get("City") or "").strip() or "Other"
-        loc = s.get("Location") or {}
+        lat, lon = coords(s)
         score = s.get("Score")
         score = score if score is not None else 9e9
         load = s.get("Load")
@@ -219,8 +261,8 @@ def cities_in_country(data, code, limit=500):
                 "tier": s.get("Tier"),
                 "score": score,
                 "tags": labels(features),
-                "lat": loc.get("Lat"),
-                "lon": loc.get("Long"),
+                "lat": lat,
+                "lon": lon,
                 "count": 1,
             }
             continue
@@ -234,8 +276,8 @@ def cities_in_country(data, code, limit=500):
                 "tier": s.get("Tier"),
                 "score": score,
                 "tags": labels(features),
-                "lat": loc.get("Lat"),
-                "lon": loc.get("Long"),
+                "lat": lat,
+                "lon": lon,
             })
 
     rows = sorted(cities.values(), key=lambda r: r["score"])
@@ -317,14 +359,14 @@ def country_place(data, code):
             continue
         if (s.get("Features") or 0) & SECURE_CORE:
             continue
-        loc = s.get("Location") or {}
-        if loc.get("Lat") is None or loc.get("Long") is None:
+        lat, lon = coords(s)
+        if lat is None or lon is None:
             continue
         return {
             "code": code,
             "city": (s.get("City") or "").strip(),
-            "lat": loc.get("Lat"),
-            "lon": loc.get("Long"),
+            "lat": lat,
+            "lon": lon,
         }
     return None
 
@@ -337,21 +379,29 @@ def locate(data, name):
     for s in data.get("LogicalServers") or []:
         if (s.get("Name") or "").upper() != want:
             continue
-        loc = s.get("Location") or {}
+        lat, lon = coords(s)
         features = s.get("Features") or 0
         place = {
             "name": s.get("Name") or "",
             "code": (s.get("ExitCountry") or "").upper(),
             "city": (s.get("City") or "").strip(),
-            "lat": loc.get("Lat"),
-            "lon": loc.get("Long"),
+            "lat": lat,
+            "lon": lon,
             # Feature bit 4 is P2P. Most servers permit it, so the panel only
             # makes a point of it when that's what you asked for.
             "p2p": bool(features & P2P),
         }
         entry_code = (s.get("EntryCountry") or "").upper()
         if (s.get("Features") or 0) & SECURE_CORE and entry_code and entry_code != place["code"]:
+            # The server's own EntryLocation is the exact entry hop; a regular
+            # server in the entry country is only the fallback for caches that
+            # don't carry it.
             entry = country_place(data, entry_code)
+            entry_lat, entry_lon = coords(s, entry=True)
+            if entry_lat is not None:
+                entry = entry or {"code": entry_code, "city": ""}
+                entry["lat"] = entry_lat
+                entry["lon"] = entry_lon
             if entry:
                 place["entry"] = entry
         return place
